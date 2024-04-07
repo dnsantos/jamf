@@ -1,0 +1,31 @@
+#!/bin/sh
+
+processId=$(ps -ef | grep 'locationd' | grep -v 'grep' | awk '{ printf $2 }')
+
+if [[ $(uname -m) == "arm64" ]]; then
+    /usr/bin/defaults write /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled -bool true
+    kill $processId
+    case $? in
+    0)
+        echo Serviço de localização ativo com sucesso.
+        ;;
+    *)
+        echo Falha ao ativar o serviço de localização.
+        echo Erro: $?
+        ;;
+    esac
+else
+    /usr/bin/defaults write /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled -bool true
+    /bin/launchctl kickstart -k system/com.apple.locationd
+    case $? in
+    0)
+        echo Serviço de localização ativo com sucesso.
+        ;;
+    *)
+        echo Falha ao ativar o serviço de localização.
+        echo Erro: $?
+        ;;
+    esac
+fi
+
+exit 0
