@@ -1,0 +1,28 @@
+#!/bin/sh
+serialNumber=$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformSerialNumber/{print $4}')
+echo Número de Série: $serialNumber
+
+modelName=$(/usr/libexec/PlistBuddy -c 'Print :0:_items:0:machine_name' /dev/stdin <<<"$(system_profiler -xml SPHardwareDataType)")
+echo Modelo: $modelName
+
+unameMachine="$(uname -m)"
+echo Processador: $unameMachine
+
+hostName=$(hostname)
+echo Hostname: $hostName
+
+lastUser=$(echo "show State:/Users/ConsoleUser" | scutil | awk '/Name :/ { print $3 }')
+echo Usuário: $lastUser
+
+language=$(defaults read -g AppleLocale)
+echo Idioma: $language
+
+interface="$(route get default | grep interface | awk '{print $2}')"
+result=$(ifconfig $interface | grep -v "inet6" | grep "inet" | awk '{print $2}')
+echo IP: $result
+
+macosVersion=$(sw_vers -productVersion)
+echo Versão do macOS: $macosVersion
+
+macosBuild=$(sw_vers -buildVersion)
+echo Build macOS: $macosBuild
