@@ -1,0 +1,68 @@
+#!/bin/bash
+
+######################################################################################################
+# OneDrive-Redirection.sh
+#
+# By: Kyle Schroeder
+#
+# Migrates users' Documents and Desktop folders from their local home directory (/Users/userid)
+# to their OneDrive - Banco Pan SA folder.  Checks if /Users/userid/OneDrive - Banco Pan SA folder exists
+# already, then checks that the folders haven't already been migrated or symlinked to 
+# a different location.  If the directories are present, then they are moved into the 
+# OneDrive folder, and a SymLink created in the /Users/userid directory pointing to the new
+# location.
+#
+# 1.6.16 - 1.0 - Initial version
+#
+######################################################################################################
+
+#Create a list of mobile user accounts who always have a UniqueID of greater than 1000
+mobileuserList=`dscl . list /Users UniqueID | awk '$2 > 1000 {print $1}'`
+redirectionFolderBase="/$(hostname)/Backup"
+jamfHelper="/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper"
+
+jamf displayMessage -message "Feche todos os aplicativos e arquivos abertos, prestes a redirecionar dados em 
+as pastas Área de Trabalho e Documentos para o OneDrive!"
+
+# Iterate through each user in the system
+for mobileuser in $mobileuserList ; do
+
+    # path to where the user's OneDrive - Banco Pan SA folder should exist
+    userOneDriveBasePath="/Users/$mobileuser/OneDrive - Banco Pan SA"
+    # full path to the root of where the backup files will be stored
+    oneDriveBackupPathBase=$userOneDriveBasePath$redirectionFolderBase
+
+    # Only continue if the user's OneDrive - Banco Pan SA folder exists
+    if [ -d "$userOneDriveBasePath" ]; then 
+
+        # Move Documents folder to OneDrive
+        if [ -d "/Users/$mobileuser/Documents" ] && [ ! -L "/Users/$mobileuser/Documents" ]; then
+            echo "Moving Documents folder to OneDrive, please wait..."
+            mv /Users/$mobileuser/Documents $oneDriveBackupPathBase/Documents
+            ln -s "$oneDriveBackupPathBase/Documents" /Users/$mobileuser/Documents
+            echo "Moved Documents folder to $oneDriveBackupPathBase/Documents"
+            jamf displayMessage -message "A pasta Documentos foi movida para OneDrive - Banco Pan SA/$(hostname)/Backup/Documents"
+        else
+            echo "Documents folder NOT found or is a symlink for user $mobileuser. Maybe already migrated?"
+            jamf displayMessage -message "A pasta Documentos NÃO foi encontrada ou é um link simbólico para o usuário. Verifique se já foi migrado. Qualquer problema entre em contato com o Suporte"
+        fi
+
+        # Move Desktop folder to OneDrive
+        if [ -d "/Users/$mobileuser/Desktop" ] && [ ! -L "/Users/$mobileuser/Desktop" ]; then
+            echo "Moving user Desktop to OneDrive, please wait..."
+            mv /Users/$mobileuser/Desktop $oneDriveBackupPathBase/Desktop
+            ln -s "$oneDriveBackupPathBase/Desktop" /Users/$mobileuser/Desktop
+            echo "Moved Desktop folder to $oneDriveBackupPathBase/Desktop"
+            jamf displayMessage -message "A pasta Desktop foi movida para OneDrive - Banco Pan SA/$(hostname)/Backup/Desktop"
+
+        else
+            echo "Desktop folder NOT found or is a symlink for user $mobileuser. Maybe already migrated?"
+            jamf displayMessage -message "A pasta Desktop NÃO foi encontrada ou é um link simbólico para o usuário. Verifique se já foi migrado. Qualquer problema entre em contato com o Suporte"
+        fi
+
+    else
+        echo "O OneDrive NÃO está configurado para este usuário ou não está no local padrão adequado ($userOneDriveBasePath)!"
+        echo "Por favor, configure o OneDrive para $mobileuser, o local padrão da paste deve ser ($userOneDriveBasePath). Se tiver dúvidas, entre em contato com o Suporte."
+    fi
+
+done
