@@ -1,0 +1,21 @@
+#!/bin/bash
+securityAgents=(
+    "Falcon CrowndStrike|InstallFalconCrowdStrike|com.crowdstrike.falcon.Agent"
+    "Qualys Cloud Agent|InstallQualysCloudAgent|qualys-cloud-agent"
+    "Teramind|InstallTeramind|tmsysd"
+)
+
+if [[ $(ps cax | grep -ic "CUI") != 0 && $(ps cax | grep -ic "edpa") != 0 ]]; then
+    echo Data Lost Prevention ✅
+else
+    echo Data Lost Prevention ☑️
+fi
+
+for app in "${securityAgents[@]}"; do
+
+    if [[ $(ps cax | grep -ic "$(echo "$app" | awk -F'|' '{print $3}')") != 0 ]]; then
+        echo $(echo "$app" | awk -F'|' '{print $1}') ✅
+    else
+        echo $(echo "$app" | awk -F'|' '{print $1}') ☑️
+    fi
+done
