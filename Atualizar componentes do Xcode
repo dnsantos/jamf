@@ -1,0 +1,5 @@
+#!/bin/sh
+
+for pkg in /Applications/Xcode.app/Contents/Resources/Packages/*.pkg; do 
+    installer -pkg "$pkg" -target /
+done
