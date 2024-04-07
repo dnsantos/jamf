@@ -1,0 +1,78 @@
+#!/bin/bash
+url_app="https://go.microsoft.com/fwlink/?linkid="
+url_icon="https://macadmins.software/icons/"
+dialog_file="/private/tmp/dialog.log"
+
+if [[ ! -f "${dialog_file}" ]]; then
+    touch "${dialog_file}"
+fi
+
+function dialogfile() {
+    echo "$1" >>"$dialog_file"
+}
+
+# Lista de programas para verificar
+apps=(
+    "525137|Microsoft Outlook|OutlookOSAppIcon.targetsize-1024.png|com.microsoft.Outlook"
+    "823060|OneDrive|OneDriveOSAppIcon.targetsize-1024.png|com.microsoft.OneDrive"
+    "869428|Microsoft Teams classic|TeamsOSAppIcon.targetsize-1024.png|com.microsoft.teams"
+    "2249065|Microsoft Teams (work or school)|Teams21.png|com.microsoft.teams2"
+    "2093504|Microsoft Edge|Edge.png|com.microsoft.edgemac"
+    "2156837|Visual Studio Code|VSCode.png|com.microsoft.VSCode"
+    "525134|Microsoft Word|WordOSAppIcon.targetsize-1024.png|com.microsoft.Word"
+    "525135|Microsoft Excel|ExcelOSAppIcon.targetsize-1024.png|com.microsoft.Excel"
+    "525136|Microsoft Power Point|PowerPointOSAppIcon.targetsize-1024.png|com.microsoft.Powerpoint"
+    "820886|Microsoft OneNote|OneNoteOSAppIcon.targetsize-1024.png|com.microsoft.onenote.mac"
+)
+
+# Inicializa um array vazio para armazenar os resultados
+results=()
+
+# Array para armazenar aplicativos abertos
+open_apps=()
+
+# Loop sobre cada aplicativo
+for app in "${apps[@]}"; do
+    # Divide a string de detalhes do aplicativo em componentes
+    url_do_programa=$url_app$(echo "$app" | awk -F '|' '{print $1}')
+    nome_do_programa=$(echo "$app" | awk -F '|' '{print $2}')
+    icon=$url_icon$(echo "$app" | awk -F '|' '{print $3}')
+
+    # Verifica se o aplicativo está instalado
+    if [ -d "/Applications/${nome_do_programa}.app" ]; then
+        status="wait"
+        statustext="Aguarde"
+
+        # Verifica se os aplicativos estão abertos
+        if pgrep "$nome_do_programa" >/dev/null; then
+            status="pending"
+            statustext="App em execução"
+            open_apps+=("$nome_do_programa")
+        fi
+
+        # Adiciona os detalhes do aplicativo ao array de resultados
+        results+=("{\"title\":\"$nome_do_programa\",\"icon\":\"$icon\",\"status\":\"$status\",\"statustext\":\"$statustext\"}")
+    fi
+done
+
+# Converte o array de resultados em uma string JSON e imprime
+listitem_json=$(printf '{"listitem":[%s]}\n' "$(
+    IFS=','
+    echo "${results[*]}"
+)")
+
+echo $listitem_json >/private/tmp/listitem_json.json
+
+dialog_desktop="
+    /usr/local/bin/dialog \
+        --message \"Os aplicativos em execução serão finalizado em 5 minutos, para aplicação das atualizações de segurança. \" \
+        --messagefont \"size=14\" \
+        --width \"800\" \
+        --height \"600\" \
+        --title \"Path Semanal\" \
+        --jsonfile \"/private/tmp/listitem_json.json\" \
+        --json \
+        --commandfile \"$dialog_file\"
+"
+
+eval "${dialog_desktop[*]}" &
