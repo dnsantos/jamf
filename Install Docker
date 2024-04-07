@@ -1,0 +1,22 @@
+#!/bin/sh
+
+loggedInUser=$(echo "show State:/Users/ConsoleUser" | scutil | awk '/Name :/ { print $3 }')
+echo O usuário logado é: ${loggedInUser}
+
+if [[ $(uname -p) == 'arm' ]]; then
+  echo A arquitetura do MacBook é: Silicon
+  curl -L "https://desktop.docker.com/mac/main/arm64/Docker.dmg?utm_source=docker&utm_medium=webreferral&utm_campaign=docs-driven-download-mac-arm64&_gl=1*u3zhy7*_ga*MjA0OTkyNjY2NC4xNjg2NjAwMjQw*_ga_XJWPQMJYHQ*MTY4NjYwMDI0MC4xLjEuMTY4NjYwMjEwMS42MC4wLjA." --output /private/tmp/docker_arm64.dmg
+  echo Montanto disco Docker
+  hdiutil attach /private/tmp/docker_arm64.dmg
+else
+	echo A arquitetura do MacBook é: Intel
+	curl -L "https://desktop.docker.com/mac/main/amd64/Docker.dmg?utm_source=docker&utm_medium=webreferral&utm_campaign=docs-driven-download-mac-amd64&_gl=1*wm1f8k*_ga*MjA0OTkyNjY2NC4xNjg2NjAwMjQw*_ga_XJWPQMJYHQ*MTY4NjYwMDI0MC4xLjEuMTY4NjYwMjEwMS42MC4wLjA." --output /private/tmp/docker_x64.dmg
+	echo Montanto disco Docker
+    hdiutil attach /private/tmp/docker_x64.dmg
+fi
+
+echo Instalando Docker no perfil do usuário ${loggedInUser}
+/Volumes/Docker/Docker.app/Contents/MacOS/install --accept-license --user="${loggedInUser}"
+
+echo Ejetando disco Docker
+hdiutil detach /Volumes/Docker
