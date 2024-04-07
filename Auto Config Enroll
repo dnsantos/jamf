@@ -1,0 +1,1412 @@
+#!/bin/bash
+####################################################################################################
+#
+# Global Variables
+#
+####################################################################################################
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Script Version and Jamf Pro Script Parameters
+# Operating System, Computer Model Name, etc.
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+# Machine Variables
+modelName=$(/usr/libexec/PlistBuddy -c 'Print :0:_items:0:machine_name' /dev/stdin <<<"$(system_profiler -xml SPHardwareDataType)")
+unameMachine="$(uname -m)"
+serialNumber=$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformSerialNumber/{print $4}')
+
+# OS Variables
+osVersion=$(sw_vers -productVersion)
+osVersionExtra=$(sw_vers -productVersionExtra)
+osBuild=$(sw_vers -buildVersion)
+requiredMinimumBuild="22E"
+osMajorVersion=$(echo "${osVersion}" | awk -F '.' '{print $1}')
+if [[ -n $osVersionExtra ]] && [[ "${osMajorVersion}" -ge 13 ]]; then
+    osVersion="${osVersion} ${osVersionExtra}"
+fi
+osName="Sonoma"
+osPath="/private/tmp"
+osUpdateUser="_swu.admin"
+osUpdatePass="${4}"
+lastBuild="$5"
+osURL="$6"
+
+# Dialog Variables
+swiftDialogMinimumRequiredVersion="2.4.0.4750"
+dialogVersion=$(/usr/local/bin/dialog --version)
+dialogBinary="/usr/local/bin/dialog"
+setupYourMacCommandFile="/private/tmp/dialog.log"
+
+# Homebrew Variables
+if [[ "$unameMachine" == "arm64" ]]; then
+    homebrewPrefix="/opt/homebrew/bin/brew"
+else
+    homebrewPrefix="/usr/local/bin/brew"
+fi
+
+# Script Variables
+scriptVersion="1.0.0"
+scriptLog="/var/log/AutoConfig.log"
+reconOptions=""
+
+# Jamf Variables
+jamfBinary="/usr/local/bin/jamf"
+setupYourMacPolicyArrayIconPrefixUrl="https://ics.services.jamfcloud.com/icon/hash_"
+
+# User Variables
+loggedInUser=$(echo "show State:/Users/ConsoleUser" | scutil | awk '/Name :/ { print $3 }')
+
+/usr/bin/curl --location --silent "https://upload.wikimedia.org/wikipedia/commons/thumb/2/24/Bancopanlogo.png/200px-Bancopanlogo.png" -o "/private/logo_banco_pan.png"
+
+####################################################################################################
+#
+# Pre-flight Checks
+#
+####################################################################################################
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Client-side Logging
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+if [[ ! -f "${scriptLog}" ]]; then
+    touch "${scriptLog}"
+fi
+
+if [[ ! -f "${setupYourMacCommandFile}" ]]; then
+    touch "${setupYourMacCommandFile}"
+fi
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Client-side Script Logging Function
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+function updateScriptLog() {
+    echo -e "$(date +%Y-%m-%d\ %H:%M:%S) - ${1}" | tee -a "${scriptLog}"
+}
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Current Logged-in User Function
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+updateScriptLog "PRE-FLIGHT CHECK: Current Logged-in User: ${loggedInUser}"
+
+function get_json_value() {
+    JSON="$1" osascript -l 'JavaScript' \
+        -e 'const env = $.NSProcessInfo.processInfo.environment.objectForKey("JSON").js' \
+        -e "JSON.parse(env).$2"
+}
+
+function createmacOSUdate() {
+    lastID=$(dscl . -list /Users UniqueID | awk '{print $2}' | sort -ug | tail -1)
+    userID=$((lastID + 1))
+
+    updateScriptLog "PRE-FLIGHT CHECK: Criando conta $osUpdateUser."
+    dscl . -create /Users/$osUpdateUser IsHidden 1
+    dscl . -create /Users/$osUpdateUser UserShell /bin/bash
+    dscl . -create /Users/$osUpdateUser RealName "Software Update Admin"
+    dscl . -create /Users/$osUpdateUser UniqueID $userID
+    dscl . -create /Users/$osUpdateUser PrimaryGroupID 80
+    dscl . -create /Users/$osUpdateUser NFSHomeDirectory /Users/$osUpdateUser
+    dscl . -passwd /Users/$osUpdateUser $osUpdatePass
+
+    # Adicionando usuário no grupo admin
+    updateScriptLog "PRE-FLIGHT CHECK: Adicionando usuário $osUpdateUser no grupo admin."
+    dseditgroup -o edit -t user -a $osUpdateUser admin
+
+    # Criando diretório home
+    updateScriptLog "Criando diretório home para o usuário $osUpdateUser."
+    createhomedir -u $osUpdateUser
+}
+
+function secureToken() {
+    if [[ $(sysadminctl -secureTokenStatus $osUpdateUser 2>&1 | awk '{ print $7 }' | sed s'/ //g') == "DISABLED" ]]; then
+        updateScriptLog "PRE-FLIGHT CHECK: Secure token desativado para conta $osUpdateUser."
+
+        enable_AdminLocal
+
+        updateScriptLog "PRE-FLIGHT CHECK: Ativando secure token para conta $osUpdateUser."
+        sysadminctl -adminUser ${loggedInUser} -adminPassword ${loginUserPWD} -secureTokenOn ${osUpdateUser} -password ${osUpdatePass}
+    else
+        updateScriptLog "PRE-FLIGHT CHECK: Secure token ativado para conta $osUpdateUser ."
+    fi
+}
+
+function account_information() {
+    if [[ $(dseditgroup -o checkmember -m $osUpdateUser localaccounts | awk '{ print $1 }') == "yes" ]]; then
+        updateScriptLog "PRE-FLIGHT CHECK: A conta $osUpdateUser foi localizada"
+        updateScriptLog "PRE-FLIGHT CHECK: Validando acesso"
+
+        dscl /Local/Default -authonly "$osUpdateUser" "$osUpdatePass" &>/dev/null
+        case $? in
+        0)
+            updateScriptLog "PRE-FLIGHT CHECK: Acessos validados com sucesso"
+            ;;
+        *)
+            updateScriptLog "PRE-FLIGHT CHECK: Falha ao validar o acesso"
+            updateScriptLog "PRE-FLIGHT CHECK: Realizando a troca da senha"
+
+            $jamfBinary resetPassword -username $osUpdateUser -password $osUpdatePass
+
+            dscl /Local/Default -authonly "$osUpdateUser" "$osUpdatePass" &>/dev/null
+            case $? in
+            0)
+                updateScriptLog "PRE-FLIGHT CHECK: Acessos validados com sucesso"
+                ;;
+            *)
+                updateScriptLog "PRE-FLIGHT CHECK: Falha ao validar a senha da conta $osUpdateUser"
+                updateScriptLog "PRE-FLIGHT CHECK: Finalizando script com erro"
+
+                exit 1
+                ;;
+            esac
+
+            ;;
+        esac
+
+        updateScriptLog "PRE-FLIGHT CHECK: Verificando secure token para conta $osUpdateUser"
+        secureToken
+    else
+        createmacOSUdate
+        secureToken
+    fi
+}
+
+function enable_AdminLocal() {
+    checkGroup=$(dseditgroup -o checkmember -m $loggedInUser admin)
+    if [[ $checkGroup == *"yes"* ]]; then
+        updateScriptLog "PRE-FLIGHT CHECK: Usuário $loggedInUser adicionado ao grupo de admin"
+    else
+        updateScriptLog "PRE-FLIGHT CHECK: Usuário $loggedInUser não está no grupo admin"
+        updateScriptLog "PRE-FLIGHT CHECK: Adicionando usuário $loggedInUser ao grupo admin"
+        dscl . -append /groups/admin GroupMembership $loggedInUser
+    fi
+}
+
+function disable_AdminLocal() {
+    checkGroup=$(dseditgroup -o checkmember -m $loggedInUser admin)
+    if [[ $checkGroup == *"yes"* ]]; then
+        updateScriptLog "PRE-FLIGHT CHECK: Usuário $loggedInUser já está no grupo de admin"
+        updateScriptLog "PRE-FLIGHT CHECK: Removendo privilegios de admin da conta ${loggedInUser}"
+        /usr/sbin/dseditgroup -o edit -d ${loggedInUser} -t user admin
+    else
+        updateScriptLog "PRE-FLIGHT CHECK: Usuário $loggedInUser não está no grupo de admin"
+    fi
+}
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Logging Preamble
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+updateScriptLog "\n\n###\n# Setup Your Mac (${scriptVersion})\n# https://snelson.us/sym\n###\n"
+updateScriptLog "PRE-FLIGHT CHECK: Initiating …"
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Confirm script is running under bash
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+if [[ "$BASH" != "/bin/bash" ]]; then
+    updateScriptLog "PRE-FLIGHT CHECK: This script must be run under 'bash', please do not run it using 'sh', 'zsh', etc.; exiting."
+    exit 1
+fi
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Confirm script is running as root
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+if [[ $(id -u) -ne 0 ]]; then
+    updateScriptLog "PRE-FLIGHT CHECK: This script must be run as root; exiting."
+    exit 1
+fi
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Validate Setup Assistant has completed
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+while pgrep -q -x "Setup Assistant"; do
+    updateScriptLog "PRE-FLIGHT CHECK: Setup Assistant is still running; pausing for 2 seconds"
+    sleep 2
+done
+
+updateScriptLog "PRE-FLIGHT CHECK: Setup Assistant is no longer running; proceeding …"
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Confirm Dock is running / user is at Desktop
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+until pgrep -q -x "Finder" && pgrep -q -x "Dock"; do
+    updateScriptLog "PRE-FLIGHT CHECK: Finder & Dock are NOT running; pausing for 1 second"
+    sleep 1
+done
+
+updateScriptLog "PRE-FLIGHT CHECK: Finder & Dock are running; proceeding …"
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Validate Logged-in System Accounts
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+updateScriptLog "PRE-FLIGHT CHECK: Check for Logged-in System Accounts …"
+
+counter="1"
+
+until { [[ "${loggedInUser}" != "_mbsetupuser" ]] || [[ "${counter}" -gt "180" ]]; } && { [[ "${loggedInUser}" != "loginwindow" ]] || [[ "${counter}" -gt "30" ]]; }; do
+
+    updateScriptLog "PRE-FLIGHT CHECK: Logged-in User Counter: ${counter}"
+    sleep 2
+    ((counter++))
+
+done
+
+loggedInUserFullname=$(id -F "${loggedInUser}")
+loggedInUserFirstname=$(echo "$loggedInUserFullname" | sed -E 's/^.*, // ; s/([^ ]*).*/\1/' | sed 's/\(.\{25\}\).*/\1…/' | awk '{print ( $0 == toupper($0) ? toupper(substr($0,1,1))substr(tolower($0),2) : toupper(substr($0,1,1))substr($0,2) )}')
+loggedInUserID=$(id -u "${loggedInUser}")
+updateScriptLog "PRE-FLIGHT CHECK: Current Logged-in User First Name: ${loggedInUserFirstname}"
+updateScriptLog "PRE-FLIGHT CHECK: Current Logged-in User ID: ${loggedInUserID}"
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Validate Operating System Version and Build
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+# Since swiftDialog requires at least macOS 12 Monterey, first confirm the major OS version
+if [[ "${osMajorVersion}" -ge 12 ]]; then
+
+    updateScriptLog "PRE-FLIGHT CHECK: macOS ${osMajorVersion} installed; checking build version ..."
+
+    # Confirm the Mac is running `requiredMinimumBuild` (or later)
+    if [[ "${osBuild}" > "${requiredMinimumBuild}" ]]; then
+
+        updateScriptLog "PRE-FLIGHT CHECK: macOS ${osVersion} (${osBuild}) installed; proceeding ..."
+
+    # When the current `osBuild` is older than `requiredMinimumBuild`; exit with error
+    else
+        updateScriptLog "PRE-FLIGHT CHECK: The installed operating system, macOS ${osVersion} (${osBuild}), needs to be updated to Build ${requiredMinimumBuild}; exiting with error."
+        osascript -e 'display dialog "Please advise your Support Representative of the following error:\r\rExpected macOS Build '${requiredMinimumBuild}' (or newer), but found macOS '${osVersion}' ('${osBuild}').\r\r" with title "Setup Your Mac: Detected Outdated Operating System" buttons {"Open Software Update"} with icon caution'
+        updateScriptLog "PRE-FLIGHT CHECK: Executing /usr/bin/open '${outdatedOsAction}' …"
+        su - "${loggedInUser}" -c "/usr/bin/open \"${outdatedOsAction}\""
+        exit 1
+
+    fi
+else
+    # The Mac is running an operating system older than macOS 12 Monterey; exit with error
+    updateScriptLog "PRE-FLIGHT CHECK: swiftDialog requires at least macOS 12 Monterey and this Mac is running ${osVersion} (${osBuild}), exiting with error."
+    osascript -e 'display dialog "Please advise your Support Representative of the following error:\r\rExpected macOS Build '${requiredMinimumBuild}' (or newer), but found macOS '${osVersion}' ('${osBuild}').\r\r" with title "Setup Your Mac: Detected Outdated Operating System" buttons {"Open Software Update"} with icon caution'
+    updateScriptLog "PRE-FLIGHT CHECK: Executing /usr/bin/open '${outdatedOsAction}' …"
+    su - "${loggedInUser}" -c "/usr/bin/open \"${outdatedOsAction}\""
+    exit 1
+fi
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Ensure computer does not go to sleep during SYM (thanks, @grahampugh!)
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+symPID="$$"
+updateScriptLog "PRE-FLIGHT CHECK: Caffeinating this script (PID: $symPID)"
+caffeinate -dimsu -w $symPID &
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Toggle `jamf` binary check-in (thanks, @robjschroeder!)
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+function toggleJamfLaunchDaemon() {
+
+    jamflaunchDaemon="/Library/LaunchDaemons/com.jamfsoftware.task.1.plist"
+
+    while [[ ! -f "${jamflaunchDaemon}" ]]; do
+        updateScriptLog "PRE-FLIGHT CHECK: Waiting for installation of ${jamflaunchDaemon}"
+        sleep 0.1
+    done
+
+    if [[ $(/bin/launchctl list | grep com.jamfsoftware.task.E) ]]; then
+
+        updateScriptLog "PRE-FLIGHT CHECK: Temporarily disable 'jamf' binary check-in"
+        /bin/launchctl bootout system "${jamflaunchDaemon}"
+
+    else
+
+        updateScriptLog "QUIT SCRIPT: Re-enabling 'jamf' binary check-in"
+        updateScriptLog "QUIT SCRIPT: 'jamf' binary check-in daemon not loaded, attempting to bootstrap and start"
+        result="0"
+
+        until [ $result -eq 3 ]; do
+
+            /bin/launchctl bootstrap system "${jamflaunchDaemon}" && /bin/launchctl start "${jamflaunchDaemon}"
+            result="$?"
+
+            if [ $result = 3 ]; then
+                updateScriptLog "QUIT SCRIPT: Staring 'jamf' binary check-in daemon"
+            else
+                updateScriptLog "QUIT SCRIPT: Failed to start 'jamf' binary check-in daemon"
+            fi
+
+        done
+
+    fi
+
+}
+
+toggleJamfLaunchDaemon
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Validate / install swiftDialog (Thanks big bunches, @acodega!)
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+function dialogInstall() {
+
+    # Get the URL of the latest PKG From the Dialog GitHub repo
+    dialogURL=$(curl -L --silent --fail "https://api.github.com/repos/swiftDialog/swiftDialog/releases/latest" | awk -F '"' "/browser_download_url/ && /pkg\"/ { print \$4; exit }")
+
+    # Expected Team ID of the downloaded PKG
+    expectedDialogTeamID="PWA5E9TQ59"
+
+    updateScriptLog "PRE-FLIGHT CHECK: Installing swiftDialog..."
+
+    # Create temporary working directory
+    workDirectory=$(/usr/bin/basename "$0")
+    tempDirectory=$(/usr/bin/mktemp -d "/private/tmp/$workDirectory.XXXXXX")
+
+    # Download the installer package
+    /usr/bin/curl --location --silent "$dialogURL" -o "$tempDirectory/Dialog.pkg"
+
+    # Verify the download
+    teamID=$(/usr/sbin/spctl -a -vv -t install "$tempDirectory/Dialog.pkg" 2>&1 | awk '/origin=/ {print $NF }' | tr -d '()')
+
+    # Install the package if Team ID validates
+    if [[ "$expectedDialogTeamID" == "$teamID" ]]; then
+
+        /usr/sbin/installer -pkg "$tempDirectory/Dialog.pkg" -target /
+        sleep 2
+        dialogVersion=$(/usr/local/bin/dialog --version)
+        updateScriptLog "PRE-FLIGHT CHECK: swiftDialog version ${dialogVersion} installed; proceeding..."
+
+    else
+
+        # Display a so-called "simple" dialog if Team ID fails to validate
+        osascript -e 'display dialog "Please advise your Support Representative of the following error:\r\r• Dialog Team ID verification failed\r\r" with title "Setup Your Mac: Error" buttons {"Close"} with icon caution'
+        completionActionOption="Quit"
+        exitCode="1"
+        quitScript
+
+    fi
+
+    # Remove the temporary working directory when done
+    /bin/rm -Rf "$tempDirectory"
+
+}
+
+function dialogCheck() {
+
+    # Check for Dialog and install if not found
+    if [ ! -e "/Library/Application Support/Dialog/Dialog.app" ]; then
+
+        updateScriptLog "PRE-FLIGHT CHECK: swiftDialog not found. Installing..."
+        dialogInstall
+
+    else
+
+        dialogVersion=$(/usr/local/bin/dialog --version)
+        if [[ "${dialogVersion}" < "${swiftDialogMinimumRequiredVersion}" ]]; then
+
+            updateScriptLog "PRE-FLIGHT CHECK: swiftDialog version ${dialogVersion} found but swiftDialog ${swiftDialogMinimumRequiredVersion} or newer is required; updating..."
+            dialogInstall
+
+        else
+
+            updateScriptLog "PRE-FLIGHT CHECK: swiftDialog version ${dialogVersion} found; proceeding..."
+
+        fi
+
+    fi
+
+}
+
+dialogCheck
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Pre-flight Check: Complete
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+updateScriptLog "PRE-FLIGHT CHECK: Complete"
+
+####################################################################################################
+#
+# Dialog Variables
+#
+####################################################################################################
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Set JAMF binary, Dialog path and Command Files
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+if [[ $unameMachine == "arm64" ]]; then
+
+    wellcomeJSON='{
+        "title": "Auto Config",
+        "icon": "/private/logo_banco_pan.png",
+        "messagefont": "size=14",
+        "width": 720,
+        "height": 500,
+        "blurscreen" : "true",
+        "textfield": [
+            {
+                "title": "Conta de rede",
+                "value": "'${loggedInUser}'",
+                "prompt": "'${loggedInUser}'"
+            },
+            {
+                "title": "Senha de rede",
+                "secure": true,
+                "required": true,
+                "prompt": "Informe a senha de sua conta de rede"
+            }
+        ],
+        "selectitems": [
+            {
+                "title": "Perfil de configuração",
+                "values": [
+                    "Banco PAN",
+                    "Terceiros",
+                    "Homologacão"
+                ],
+                "style": "radio"
+            }
+        ]
+    }'
+
+    pwdCheckJSON='{
+        "title": "none",
+        "messagefont": "size=14",
+        "width": 350,
+        "height": 175,
+        "blurscreen" : "true",
+        "textfield": [
+            {
+                "title": "Senha de rede",
+                "secure": true,
+                "required": true,
+                "prompt": "Informe a senha de sua conta de rede"
+            }
+        ]
+    }'
+
+    echo $wellcomeJSON >/private/tmp/wellcomejson.json
+    echo $pwdCheckJSON >/private/tmp/pwdCheckJSON.json
+
+    f1entry=$(
+        $dialogBinary \
+            --message "Por favor, preencha os campos obrigatórios e escolha qual perfil de configuração deseja aplicar em seu MacBook. \n\n ### Perfil de Configuração \n\n * Banco PAN - Perfil para funcionário interno, a conta de rede é o RE  \n * Terceiros - Perfil para funcionário externo, conta de rede é o CPF  \n * Homologação - Perfil voltado para teste de homologação" \
+            --infobox "### Sobre o MacBook \n\nModelo: $modelName  \n Serial: $serialNumber\n Versão: $osVersion  \n Build: $osBuild  \n " \
+            --jsonfile /private/tmp/wellcomejson.json \
+            --json
+    )
+
+    outputJSON='{"output": ['$f1entry']}'
+    outputJSON=$(echo $outputJSON | sed 's/Conta de rede/networkAccount/ ; s/Perfil de configuração/configurationProfile/ ; s/Senha de rede/networkPass/ ; s/e-mail/mail/')
+    userName=$(get_json_value "$outputJSON" 'output[0].networkAccount')
+    loginUserPWD=$(get_json_value "$outputJSON" 'output[0].networkPass')
+    profile=$(get_json_value "$outputJSON" 'output[0].configurationProfile' | awk -F ':' '{print $3}')
+
+    validateUserPWD=$(dscl /Local/Default -authonly ${loggedInUser} ${loginUserPWD})
+
+    attemptsPWD=0
+
+    while ([[ $validateUserPWD != "" ]] && [[ $attemptsPWD -lt 3 ]]); do
+        pwdCheck=$(
+            $dialogBinary \
+                --message "Senha invalida, por favor verifique a senha da conta **$loggedInUser**, e tente novamente." \
+                --icon "none" \
+                --jsonfile /private/tmp/pwdCheckJSON.json \
+                --json
+        )
+        loginUserPWD=$(echo $(echo $pwdCheck | $whereJQ '."Senha de rede"') | sed 's/"//g')
+        validateUserPWD=$(dscl /Local/Default -authonly ${loggedInUser} ${validatePass})
+        attemptsPWD=$((attemptsPWD + 1))
+    done
+
+    account_information
+
+    disable_AdminLocal
+else
+    wellcomeJSON='{
+        "title": "Auto Config",
+        "icon": "/private/logo_banco_pan.png",
+        "messagefont": "size=14",
+        "width": 720,
+        "height": 500,
+        "blurscreen" : "true",
+        "selectitems": [
+            {
+                "title": "Perfil de configuração",
+                "values": [
+                    "Banco PAN",
+                    "Terceiros",
+                    "Homologacão"
+                ],
+                "style": "radio"
+            }
+        ]
+    }'
+
+    echo $wellcomeJSON >/private/tmp/wellcomejson.json
+
+    f1entry=$(
+        $dialogBinary \
+            --message "Por favor, escolha qual perfil de configuração deseja aplicar em seu MacBook. \n\n ### Perfil de Configuração \n\n * Banco PAN - Perfil para funcionário interno  \n * Terceiros - Perfil para funcionário externo  \n * Homologação - Perfil voltado para teste de homologação" \
+            --infobox "### Sobre o MacBook \n\nModelo: $modelName  \n Serial: $serialNumber\n Versão: $osVersion  \n Build: $osBuild  \n " \
+            --jsonfile /private/tmp/wellcomejson.json \
+            --json
+    )
+    outputJSON='{"output": ['$f1entry']}'
+    outputJSON=$(echo $outputJSON | sed 's/Conta de rede/networkAccount/ ; s/Perfil de configuração/configurationProfile/ ; s/Senha de rede/networkPass/ ; s/e-mail/mail/')
+    profile=$(get_json_value "$outputJSON" 'output[0].configurationProfile' | awk -F ':' '{print $3}')
+fi
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# programs list-related
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+function policyJSONConfiguration() {
+
+    updateScriptLog "WELCOME DIALOG: PolicyJSON Configuration: $profile"
+
+    case ${profile} in
+    "Banco PAN" | 0)
+
+        policyJSON='
+            {
+                "steps": [
+                    {
+                        "listitem": "macOS Update",
+                        "icon": "d42abad98d84d34f8eaf1a5143b4de18f2d58c00ed6aa9890c688497d6add6e8",
+                        "progresstext": "Buscando atualizações disponíveis para o macOS.",
+                        "trigger_list": [
+                            {
+                                "trigger": "macos_swu",
+                                "validation": "Local"
+                            }
+                        ]
+                    },                    
+                    {
+                        "listitem": "Rosetta",
+                        "icon": "a0d88ff58c23aed4abb94bc5ac3067132e7dc21c17961a4b762926e85c38e1d9",
+                        "progresstext": "Com o Rosetta é possível executar uma app feito para processador Intel, no processador Apple Silicon.",
+                        "trigger_list": [
+                            {
+                                "trigger": "rosettaInstall",
+                                "validation": "Local"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "FileVault Disk Encryption",
+                        "icon": "f9ba35bd55488783456d64ec73372f029560531ca10dfa0e8154a46d7732b913",
+                        "progresstext": "FileVault está integrado no macOS e fornece criptografia de disco completo para ajudar a impedir o acesso não autorizado ao Mac.",
+                        "trigger_list": [
+                            {
+                                "trigger": "filevaultEnable",
+                                "validation": "Local"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Microsoft Edge",
+                        "icon": "e60f4caa7ae6ba6172aea441bb10de76627567566e9745b5531dd68508eb9b28",
+                        "progresstext": "O Microsoft Edge é o navegador padrão do Banco PAN, desenvolvido pela Microsoft.",
+                        "trigger_list": [
+                            {
+                                "trigger": "InstallMSEdge",
+                                "validation": "/Applications/Microsoft Edge.app/Contents/Info.plist"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Microsoft Onedrive",
+                        "icon": "31aae394981345a22c921177da596385fee34e49b765e525dfbade2b17c7f52a",
+                        "progresstext": "O Microsoft Onedrive é o armazenamento em nuvem da Microsoft, nele você pode salvar e compartilhar todos os seus arquivos com segurança.",
+                        "trigger_list": [
+                            {
+                                "trigger": "InstallMSOnedrive",
+                                "validation": "/Applications/OneDrive.app/Contents/Info.plist"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Microsoft Outlook",
+                        "icon": "11a2bf5f107c4c5c95eb54735808a1536f7ae251a1c8a524f345fbea144533a2",
+                        "progresstext": "O Microsoft Outlook é o gerenciador de e-mail paradrão do Banco PAN, com ele você poderá enciar seus e-mails e agendar reuniões e compromissos em sua agenda.",
+                        "trigger_list": [
+                            {
+                                "trigger": "InstallMSOutlook",
+                                "validation": "/Applications/Microsoft Outlook.app/Contents/Info.plist"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Microsoft Teams",
+                        "icon": "cc5c4c3a4998a626f86f07cf37368eaa42f1e56ac656ec9c223658982091d103",
+                        "progresstext": "O Microsoft Teams é possível realziar reuniões e conferencias de forma rápida e fácil.",
+                        "trigger_list": [
+                            {
+                                "trigger": "InstallMSTeams",
+                                "validation": "/Applications/Microsoft Teams classic.app/Contents/Info.plist"
+                            },
+                            {
+                                "trigger": "InstallMSTeams",
+                                "validation": "/Applications/Microsoft Teams (work or school).app/Contents/Info.plist"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Agentes de Segurança",
+                        "icon": "fbdab23b9480cf6ca75203eb59ed5b3a82351183690b99a9ecda683af77cfc1d",
+                        "progresstext": "Os agentes de segurança são necessários para o Compliance do Mac, eles garantem a segurança da máquina e dos dados que serão utilizados.",
+                        "trigger_list": [
+                            {
+                                "trigger": "secureAgents",
+                                "validation": "Local"
+                            }
+                        ]
+                    },                     
+                    {
+                        "listitem": "Palo Alto GlobalProtect",
+                        "icon": "fc8f940ac0df295337790eb13f47daabe3fd88fcf90c5d1033dcf917d7d8d8c3",
+                        "progresstext": "Use o Palo Alto GlobalProtect para estabelecer a conexão de VPN com a rede do Banco PAN.",
+                        "trigger_list": [
+                            {
+                                "trigger": "globalProtectInstall",
+                                "validation": "Local"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Computer Inventory",
+                        "icon": "85f13a00ddd0d1f427c8ea28697ce0c27ae5aecc164314e1ec192e93da7a28fa",
+                        "progresstext": "Sincronizando as informações do seu MacBook com o servidor Jamf.",
+                        "trigger_list": [
+                            {
+                                "trigger": "recon",
+                                "validation": "None"
+                            }
+                        ]
+                    }
+                ]
+            }
+            '
+        ;;
+    "Terceiros" | 1)
+
+        policyJSON='
+            {
+                "steps": [
+                    {
+                        "listitem": "macOS Update",
+                        "icon": "d42abad98d84d34f8eaf1a5143b4de18f2d58c00ed6aa9890c688497d6add6e8",
+                        "progresstext": "Buscando atualizações disponíveis para o macOS.",
+                        "trigger_list": [
+                            {
+                                "trigger": "macos_swu",
+                                "validation": "Local"
+                            }
+                        ]
+                    },                       
+                    {
+                        "listitem": "Rosetta",
+                        "icon": "a0d88ff58c23aed4abb94bc5ac3067132e7dc21c17961a4b762926e85c38e1d9",
+                        "progresstext": "Com o Rosetta é possível executar uma app feito para processador Intel, no processador Apple Silicon.",
+                        "trigger_list": [
+                            {
+                                "trigger": "rosettaInstall",
+                                "validation": "Local"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "FileVault Disk Encryption",
+                        "icon": "f9ba35bd55488783456d64ec73372f029560531ca10dfa0e8154a46d7732b913",
+                        "progresstext": "FileVault está integrado no macOS e fornece criptografia de disco completo para ajudar a impedir o acesso não autorizado ao Mac.",
+                        "trigger_list": [
+                            {
+                                "trigger": "filevaultEnable",
+                                "validation": "Local"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Microsoft Edge",
+                        "icon": "e60f4caa7ae6ba6172aea441bb10de76627567566e9745b5531dd68508eb9b28",
+                        "progresstext": "O Microsoft Edge é o navegador desenvolvido pela Microsoft.",
+                        "trigger_list": [
+                            {
+                                "trigger": "InstallMSEdge",
+                                "validation": "/Applications/Microsoft Edge.app/Contents/Info.plist"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Google Chrome",
+                        "icon": "7afa30bad467427b6e294436afd5d542043c9dc1e37d1f241c867c53a1546091",
+                        "progresstext": "O Goole Chrome é o navegador desenvolvido pela Google.",
+                        "trigger_list": [
+                            {
+                                "trigger": "InstallGoogleChrome",
+                                "validation": "/Applications/Google Chrome.app/Contents/Info.plist"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Agentes de Segurança",
+                        "icon": "fbdab23b9480cf6ca75203eb59ed5b3a82351183690b99a9ecda683af77cfc1d",
+                        "progresstext": "Os agentes de segurança são necessários para o Compliance do Mac, eles garantem a segurança da máquina e dos dados que serão utilizados.",
+                        "trigger_list": [
+                            {
+                                "trigger": "secureAgents",
+                                "validation": "Local"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Computer Inventory",
+                        "icon": "85f13a00ddd0d1f427c8ea28697ce0c27ae5aecc164314e1ec192e93da7a28fa",
+                        "progresstext": "Sincronizando as informações do seu MacBook com o servidor Jamf.",
+                        "trigger_list": [
+                            {
+                                "trigger": "recon",
+                                "validation": "None"
+                            }
+                        ]
+                    }
+                ]
+            }
+            '
+        ;;
+    "Homologação" | 2)
+
+        policyJSON='
+            {
+                "steps": [
+                    {
+                        "listitem": "macOS Update",
+                        "icon": "d42abad98d84d34f8eaf1a5143b4de18f2d58c00ed6aa9890c688497d6add6e8",
+                        "progresstext": "Buscando atualizações disponíveis para o macOS.",
+                        "trigger_list": [
+                            {
+                                "trigger": "macos_swu",
+                                "validation": "Local"
+                            }
+                        ]
+                    },                       
+                    {
+                        "listitem": "Rosetta",
+                        "icon": "###",
+                        "progresstext": "Rosetta permite que um Mac com processador Apple use aplicativos criados para um Mac com um processador Intel.",
+                        "trigger_list": [
+                            {
+                                "trigger": "rosettaInstall",
+                                "validation": "None"
+                            },
+                            {
+                                "trigger": "rosetta",
+                                "validation": "Local"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "FileVault Disk Encryption",
+                        "icon": "###",
+                        "progresstext": "FileVault está integrado no macOS e fornece criptografia de disco completo para ajudar a impedir o acesso não autorizado ao Mac.",
+                        "trigger_list": [
+                            {
+                                "trigger": "filevaultEnable",
+                                "validation": "Local"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Agentes de Segurança",
+                        "icon": "fbdab23b9480cf6ca75203eb59ed5b3a82351183690b99a9ecda683af77cfc1d",
+                        "progresstext": "Os agentes de segurança são necessários para o Compliance do Mac, eles garantem a segurança da máquina e dos dados que serão utilizados.",
+                        "trigger_list": [
+                            {
+                                "trigger": "secureAgents",
+                                "validation": "Local"
+                            }
+                        ]
+                    },
+                    {
+                        "listitem": "Computer Inventory",
+                        "icon": "85f13a00ddd0d1f427c8ea28697ce0c27ae5aecc164314e1ec192e93da7a28fa",
+                        "progresstext": "Sincronizando as informações do seu MacBook com o servidor Jamf.",
+                        "trigger_list": [
+                            {
+                                "trigger": "recon",
+                                "validation": "None"
+                            }
+                        ]
+                    }
+                ]
+            }
+            '
+        ;;
+    esac
+}
+
+function dialogUpdateSetupYourMac() {
+    updateScriptLog "SETUP YOUR MAC DIALOG: $1"
+    echo "$1" >>"$setupYourMacCommandFile"
+}
+
+function confirmPolicyExecution() {
+    trigger="${1}"
+    validation="${2}"
+    updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution: '${trigger}' '${validation}'"
+
+    case ${validation} in
+
+    */*) # If the validation variable contains a forward slash (i.e., "/"), presume it's a path and check if that path exists on disk
+        if [[ -f "${validation}" ]]; then
+            updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution: ${validation} exists; skipping 'run_jamf_trigger ${trigger}'"
+        else
+            updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution: ${validation} does NOT exist; executing 'run_jamf_trigger ${trigger}'"
+            run_jamf_trigger "${trigger}"
+        fi
+        ;;
+
+    "None")
+        updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution: ${validation}"
+        if [[ "${debugMode}" == "true" ]] || [[ "${debugMode}" == "verbose" ]]; then
+            sleep 1
+        else
+            run_jamf_trigger "${trigger}"
+        fi
+        ;;
+
+    *)
+        updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution Catch-all: ${validation}"
+        if [[ "${debugMode}" == "true" ]] || [[ "${debugMode}" == "verbose" ]]; then
+            sleep 1
+        else
+            run_jamf_trigger "${trigger}"
+        fi
+        ;;
+
+    esac
+
+}
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Execute Jamf Pro Policy Custom Events (thanks, @smithjw)
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+function run_jamf_trigger() {
+
+    # Output Line Number in `verbose` Debug Mode
+    if [[ "${debugMode}" == "verbose" ]]; then updateScriptLog "# # # SETUP YOUR MAC VERBOSE DEBUG MODE: Line No. ${LINENO} # # #"; fi
+
+    trigger="$1"
+
+    if [[ "${debugMode}" == "true" ]] || [[ "${debugMode}" == "verbose" ]]; then
+
+        updateScriptLog "SETUP YOUR MAC DIALOG: DEBUG MODE: TRIGGER: $jamfBinary policy -trigger $trigger"
+        if [[ "$trigger" == "recon" ]]; then
+            updateScriptLog "SETUP YOUR MAC DIALOG: DEBUG MODE: RECON: $jamfBinary recon ${reconOptions}"
+        fi
+        sleep 1
+
+    elif [[ "$trigger" == "recon" ]]; then
+
+        dialogUpdateSetupYourMac "listitem: index: $i, status: wait, statustext: Atualizando …, "
+        updateScriptLog "SETUP YOUR MAC DIALOG: Updating computer inventory with the following reconOptions: \"${reconOptions}\" …"
+        eval "${jamfBinary} recon ${reconOptions}"
+
+    else
+
+        updateScriptLog "SETUP YOUR MAC DIALOG: RUNNING: $jamfBinary policy -event $trigger"
+        eval "${jamfBinary} policy -event ${trigger}" # Add comment for policy testing
+        # eval "${jamfBinary} policy -event ${trigger} -verbose | tee -a ${scriptLog}"    # Remove comment for policy testing
+
+    fi
+
+}
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Confirm Policy Execution
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+function confirmPolicyExecution() {
+
+    # Output Line Number in `verbose` Debug Mode
+    if [[ "${debugMode}" == "verbose" ]]; then updateScriptLog "# # # SETUP YOUR MAC VERBOSE DEBUG MODE: Line No. ${LINENO} # # #"; fi
+
+    trigger="${1}"
+    validation="${2}"
+    updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution: '${trigger}' '${validation}'"
+
+    case ${validation} in
+
+    */*) # If the validation variable contains a forward slash (i.e., "/"), presume it's a path and check if that path exists on disk
+        if [[ "${debugMode}" == "true" ]] || [[ "${debugMode}" == "verbose" ]]; then
+            updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution: DEBUG MODE: Skipping 'run_jamf_trigger ${trigger}'"
+            sleep 1
+        elif [[ -f "${validation}" ]]; then
+            updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution: ${validation} exists; skipping 'run_jamf_trigger ${trigger}'"
+        else
+            updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution: ${validation} does NOT exist; executing 'run_jamf_trigger ${trigger}'"
+            run_jamf_trigger "${trigger}"
+        fi
+        ;;
+
+    "None")
+        updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution: ${validation}"
+        if [[ "${debugMode}" == "true" ]] || [[ "${debugMode}" == "verbose" ]]; then
+            sleep 1
+        else
+            run_jamf_trigger "${trigger}"
+        fi
+        ;;
+
+    *)
+        updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution Catch-all: ${validation}"
+        if [[ "${debugMode}" == "true" ]] || [[ "${debugMode}" == "verbose" ]]; then
+            sleep 1
+        else
+            run_jamf_trigger "${trigger}"
+        fi
+        ;;
+
+    esac
+
+}
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Validate Policy Result
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+function validatePolicyResult() {
+    trigger="${1}"
+    validation="${2}"
+    updateScriptLog "SETUP YOUR MAC DIALOG: Validate Policy Result: '${trigger}' '${validation}'"
+
+    case ${validation} in
+
+    ###
+    # Absolute Path
+    # Simulates pre-v1.6.0 behavior, for example: "/Applications/Microsoft Teams.app/Contents/Info.plist"
+    ###
+
+    */*)
+        updateScriptLog "SETUP YOUR MAC DIALOG: Validate Policy Result: Testing for \"$validation\" …"
+        if [[ -f "${validation}" ]]; then
+            dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Instalado"
+        else
+            dialogUpdateSetupYourMac "listitem: index: $i, status: fail, statustext: Falha"
+            jamfProPolicyTriggerFailure="failed"
+            exitCode="1"
+            jamfProPolicyNameFailures+="• $listitem  \n"
+        fi
+        ;;
+
+    ###
+    # Local
+    # Validation within this script, for example: "rosetta" or "filevault"
+    ###
+
+    "Local")
+        case ${trigger} in
+        macos_swu)
+            updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: macOS Update Status … "
+            dialogUpdateSetupYourMac "listitem: index: $i, status: wait, statustext: Buscando atualizações"
+            dialogUpdateSetupYourMac "progresstext: Verificando se existe alguma atualização pendente..."
+
+            if [[ "$osBuild" != "$lastBuild" ]]; then
+                updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: macOS Update is Outdated"
+                updateScriptLog "SETUP YOUR MAC DIALOG: Downloading macOS build $lastBuild"
+                dialogUpdateSetupYourMac "listitem: index: $i, status: wait, statustext: Baixando"
+                dialogUpdateSetupYourMac "progresstext: Baixando build $lastBuild..."
+                curl -s -L $osURL -o $osPath/InstallAssistant.pkg
+
+                case $? in
+                0)
+                    updateScriptLog "SETUP YOUR MAC DIALOG: Download success"
+                    dialogUpdateSetupYourMac "listitem: index: $i, status: pending, statustext: Instalando"
+                    dialogUpdateSetupYourMac "progresstext: Instalando assitente de atualização..."
+                    installer -pkg $osPath/InstallAssistant.pkg -target /
+                    case $? in
+                    0)
+                        updateScriptLog "SETUP YOUR MAC DIALOG: Install success"
+                        dialogUpdateSetupYourMac "listitem: index: $i, status: progress, statustext: Atualizando"
+                        dialogUpdateSetupYourMac "progresstext: Atualizando macOS para nova build $lastBuild..."
+                        if [[ "$unameMachine" == "arm64" ]]; then
+                            echo $osUpdatePass | "/Applications/Install macOS $osName.app/Contents/Resources/startosinstall" --agreetolicense --forcequitapps --user $osUpdateUser --stdinpass --rebootdelay 50
+                        else
+                            "/Applications/Install macOS $osName.app/Contents/Resources/startosinstall" --agreetolicense --forcequitapps --rebootdelay 50
+                        fi
+
+                        case $? in
+                        0)
+                            updateScriptLog "SETUP YOUR MAC DIALOG: Update success"
+                            dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Concluído"
+                            dialogUpdateSetupYourMac "progresstext: Atualização finalizada com sucesso..."
+                            sleep 10
+                            dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Reiniciando"
+                            dialogUpdateSetupYourMac "progresstext: Reiniciando seu $modelName para aplicar as atualizações, as configurações continuaram após o restart da máquina..."
+                            sleep 5
+                            reboot
+                            ;;
+                        *)
+                            updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: macOS Update is not Updated."
+                            dialogUpdateSetupYourMac "listitem: index: $i, status: fail, statustext: Falha"
+                            dialogUpdateSetupYourMac "progresstext: Falha na atualização do seu $modelName..."
+                            ;;
+                        esac
+                        ;;
+                    esac
+                    ;;
+                esac
+            else
+                updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: macOS Update is Updated."
+                dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Atualizado"
+            fi
+            ;;
+        rosettaInstall)
+            updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Rosetta 2 … " # Thanks, @smithjw!
+            dialogUpdateSetupYourMac "listitem: index: $i, status: wait, statustext: Verificando …"
+            arch=$(/usr/bin/arch)
+            if [[ "${arch}" == "arm64" ]]; then
+                # Mac with Apple silicon; check for Rosetta
+                rosettaTest=$(
+                    arch -x86_64 /usr/bin/true 2>/dev/null
+                    echo $?
+                )
+                if [[ "${rosettaTest}" -eq 0 ]]; then
+                    # Installed
+                    updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Rosetta 2 is installed"
+                    dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Executando"
+                else
+                    softwareupdate --install-rosetta --agree-to-license
+                    case $? in
+                    0)
+                        updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Rosetta 2 is installed"
+                        dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Executando"
+                        ;;
+                    *)
+                        # Not Installed
+                        updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Rosetta 2 is NOT installed"
+                        dialogUpdateSetupYourMac "listitem: index: $i, status: fail, statustext: Falha"
+                        jamfProPolicyTriggerFailure="failed"
+                        exitCode="1"
+                        jamfProPolicyNameFailures+="• $listitem  \n"
+                        ;;
+                    esac
+                fi
+            else
+                # Inelligible
+                updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Rosetta 2 is not applicable"
+                dialogUpdateSetupYourMac "listitem: index: $i, status: error, statustext: Inelegível"
+            fi
+            ;;
+        filevaultEnable)
+            updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Validate FileVault … "
+            dialogUpdateSetupYourMac "listitem: index: $i, status: wait, statustext: Verificando …"
+            updateScriptLog "SETUP YOUR MAC DIALOG: Validate Policy Result: Pausing for 5 seconds for FileVault … "
+            sleep 5 # Arbitrary value; tuning needed
+            if [[ -f /Library/Preferences/com.apple.fdesetup.plist ]]; then
+                fileVaultStatus=$(fdesetup status -extended -verbose 2>&1)
+                case ${fileVaultStatus} in
+                *"FileVault is On."*)
+                    updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: FileVault: FileVault is On."
+                    dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Habilitado"
+                    ;;
+                *"Deferred enablement appears to be active for user"*)
+                    updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: FileVault: Enabled"
+                    dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Habilitado (próximo login)"
+                    ;;
+                *)
+                    ${jamfBinary} policy -event filevaultEnable
+                    case $? in
+                    0)
+                        Validate=$((Validate + 1))
+                        ;;
+                    esac
+                    dialogUpdateSetupYourMac "listitem: index: $i, status: error, statustext: Desconhecido"
+                    jamfProPolicyTriggerFailure="failed"
+                    exitCode="1"
+                    jamfProPolicyNameFailures+="• $listitem  \n"
+                    ;;
+                esac
+            else
+                updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: '/Library/Preferences/com.apple.fdesetup.plist' NOT Found"
+                dialogUpdateSetupYourMac "listitem: index: $i, status: fail, statustext: Falha"
+                jamfProPolicyTriggerFailure="failed"
+                exitCode="1"
+                jamfProPolicyNameFailures+="• $listitem  \n"
+            fi
+            ;;
+        globalProtectInstall)
+            updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Palo Alto Networks GlobalProtect Status … "
+            dialogUpdateSetupYourMac "listitem: index: $i, status: wait, statustext: Verificando …"
+            if [[ -d /Applications/GlobalProtect.app ]]; then
+                updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Pausing for 10 seconds to allow Palo Alto Networks GlobalProtect Services … "
+                sleep 10 # Arbitrary value; tuning needed
+                if [[ -f /Library/Preferences/com.paloaltonetworks.GlobalProtect.settings.plist ]]; then
+                    globalProtectStatus=$(/usr/libexec/PlistBuddy -c "print :Palo\ Alto\ Networks:GlobalProtect:PanGPS:disable-globalprotect" /Library/Preferences/com.paloaltonetworks.GlobalProtect.settings.plist)
+                    case "${globalProtectStatus}" in
+                    "0")
+                        updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Palo Alto Networks GlobalProtect Status: Enabled"
+                        dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Executando"
+                        ;;
+                    "1")
+                        updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Palo Alto Networks GlobalProtect Status: Disabled"
+                        dialogUpdateSetupYourMac "listitem: index: $i, status: fail, statustext: Falha"
+                        jamfProPolicyTriggerFailure="failed"
+                        exitCode="1"
+                        jamfProPolicyNameFailures+="• $listitem  \n"
+                        ;;
+                    *)
+                        updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Palo Alto Networks GlobalProtect Status: Unknown"
+                        dialogUpdateSetupYourMac "listitem: index: $i, status: fail, statustext: Desconhecido"
+                        jamfProPolicyTriggerFailure="failed"
+                        exitCode="1"
+                        jamfProPolicyNameFailures+="• $listitem  \n"
+                        ;;
+                    esac
+                else
+                    updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Palo Alto Networks GlobalProtect Not Found"
+                    dialogUpdateSetupYourMac "listitem: index: $i, status: fail, statustext: Falha"
+                    jamfProPolicyTriggerFailure="failed"
+                    exitCode="1"
+                    jamfProPolicyNameFailures+="• $listitem  \n"
+                fi
+            else
+                ${jamfBinary} policy -event InstallGlobalProtect
+                updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Pausing for 10 seconds to allow Palo Alto Networks GlobalProtect Services … "
+                sleep 10 # Arbitrary value; tuning needed
+                if [[ -f /Library/Preferences/com.paloaltonetworks.GlobalProtect.settings.plist ]]; then
+                    globalProtectStatus=$(/usr/libexec/PlistBuddy -c "print :Palo\ Alto\ Networks:GlobalProtect:PanGPS:disable-globalprotect" /Library/Preferences/com.paloaltonetworks.GlobalProtect.settings.plist)
+                    case "${globalProtectStatus}" in
+                    "0")
+                        updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Palo Alto Networks GlobalProtect Status: Enabled"
+                        dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Executando"
+                        ;;
+                    "1")
+                        updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Palo Alto Networks GlobalProtect Status: Disabled"
+                        dialogUpdateSetupYourMac "listitem: index: $i, status: fail, statustext: Falha"
+                        jamfProPolicyTriggerFailure="failed"
+                        exitCode="1"
+                        jamfProPolicyNameFailures+="• $listitem  \n"
+                        ;;
+                    *)
+                        updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Palo Alto Networks GlobalProtect Status: Unknown"
+                        dialogUpdateSetupYourMac "listitem: index: $i, status: fail, statustext: Desconhecido"
+                        jamfProPolicyTriggerFailure="failed"
+                        exitCode="1"
+                        jamfProPolicyNameFailures+="• $listitem  \n"
+                        ;;
+                    esac
+                else
+                    dialogUpdateSetupYourMac "listitem: index: $i, status: fail, statustext: Falha"
+                    jamfProPolicyTriggerFailure="failed"
+                    exitCode="1"
+                    jamfProPolicyNameFailures+="• $listitem  \n"
+                fi
+            fi
+            ;;
+        secureAgents)
+            updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Agentes de Segurança Status … "
+            dialogUpdateSetupYourMac "listitem: index: $i, status: wait, statustext: Verificando"
+            securityAgents=(
+                "qualys-cloud-agent|InstallQualysCloudAgent"
+                "com.crowdstrike.falcon.Agent|InstallFalconCrowdStrike"
+                "tmsysd|InstallTeramind"
+            )
+
+            Validate=0
+
+            for app in "${securityAgents[@]}"; do
+                if [[ $(ps cax | grep -ic "$(echo "$app" | awk -F'|' '{print $1}')") != 0 ]]; then
+                    Validate=$((Validate + 1))
+                else
+                    ${jamfBinary} policy -event "$(echo "$app" | awk -F'|' '{print $2}')"
+                    case $? in
+                    0)
+                        Validate=$((Validate + 1))
+                        ;;
+                    esac
+                fi
+            done
+
+            if [[ $(ps cax | grep -ic "CUI") != 0 && $(ps cax | grep -ic "edpa") != 0 ]]; then
+                Validate=$((Validate + 1))
+            else
+                ${jamfBinary} policy -event InstallSymantecDLP
+                case $? in
+                0)
+                    Validate=$((Validate + 1))
+                    ;;
+                esac
+            fi
+
+            if [[ $Validate == 4 ]]; then
+                updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Result: Agentes de Segurança Status: Enabled"
+                dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Executando"
+            else
+                dialogUpdateSetupYourMac "listitem: index: $i, status: fail, statustext: Falha"
+                jamfProPolicyTriggerFailure="failed"
+                exitCode="1"
+                jamfProPolicyNameFailures+="• $listitem  \n"
+            fi
+            ;;
+        *)
+            updateScriptLog "SETUP YOUR MAC DIALOG: Locally Validate Policy Results Local Catch-all: ${validation}"
+            ;;
+        esac
+        ;;
+    "None")
+        # Output Line Number in `verbose` Debug Mode
+        updateScriptLog "SETUP YOUR MAC DIALOG: Confirm Policy Execution: ${validation}"
+        dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Instalado"
+        if [[ "${trigger}" == "recon" ]]; then
+            dialogUpdateSetupYourMac "listitem: index: $i, status: wait, statustext: Atualizando …, "
+            updateScriptLog "SETUP YOUR MAC DIALOG: Updating computer inventory with the following reconOptions: \"${reconOptions}\" …"
+            eval "${jamfBinary} recon ${reconOptions}"
+            dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Atualizado"
+        elif [[ "${trigger}" == "secureAgents" ]]; then
+            dialogUpdateSetupYourMac "listitem: index: $i, status: wait, statustext: Agaurde …, "
+            updateScriptLog "SETUP YOUR MAC DIALOG: Check if the security agents installed …"
+            ${jamfBinary} policy -event ${trigger}
+            dialogUpdateSetupYourMac "listitem: index: $i, status: success, statustext: Executando"
+        fi
+        ;;
+    *)
+        # Output Line Number in `verbose` Debug Mode
+        if [[ "${debugMode}" == "verbose" ]]; then updateScriptLog "# # # SETUP YOUR MAC VERBOSE DEBUG MODE: Line No. ${LINENO} # # #"; fi
+        updateScriptLog "SETUP YOUR MAC DIALOG: Validate Policy Results Catch-all: ${validation}"
+        dialogUpdateSetupYourMac "listitem: index: $i, status: error, statustext: Erro"
+        ;;
+
+    esac
+
+}
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Kill a specified process (thanks, @grahampugh!)
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+function killProcess() {
+    process="$1"
+    if process_pid=$(pgrep -a "${process}" 2>/dev/null); then
+        updateScriptLog "Attempting to terminate the '$process' process …"
+        updateScriptLog "(Termination message indicates success.)"
+        kill "$process_pid" 2>/dev/null
+        if pgrep -a "$process" >/dev/null; then
+            updateScriptLog "ERROR: '$process' could not be terminated."
+        fi
+    else
+        updateScriptLog "The '$process' process isn't running."
+    fi
+}
+
+dialogSetupYourMacCMD="$dialogBinary \
+--title \"Auto Config\" \
+--message \"Agaurde enquanto os programas estão sendo instalados...\" \
+--icon \"/private/logo_banco_pan.png\" \
+--infobox \"### Sobre o MacBook \n\nModelo: $modelName  \n Serial: $serialNumber\n Versão: $osVersion  \n Build: $osBuild  \n\" \
+--progress \
+--progresstext \"Inicinado configuração …\" \
+--button1text \"Aguarde\" \
+--button1disabled \
+--infotext \"$dialogVersion\" \
+--titlefont 'shadow=true, size=40' \
+--messagefont 'size=14' \
+--height '780' \
+--position 'centre' \
+--blurscreen \
+--commandfile \"$setupYourMacCommandFile\" "
+
+eval "${dialogSetupYourMacCMD[*]}" &
+sleep 0.3
+
+policyJSONConfiguration
+
+dialog_step_length=$(get_json_value "${policyJSON}" "steps.length")
+for ((i = 0; i < dialog_step_length; i++)); do
+    listitem=$(get_json_value "${policyJSON}" "steps[$i].listitem")
+    list_item_array+=("$listitem")
+    icon=$(get_json_value "${policyJSON}" "steps[$i].icon")
+    icon_url_array+=("$icon")
+
+    curl -L -s $icon_url_array
+done
+
+totalProgressSteps=$(get_json_value "${policyJSON}" "steps.length")
+progressIncrementValue=$((100 / totalProgressSteps))
+updateScriptLog "SETUP YOUR MAC DIALOG: Total Number of Steps: ${totalProgressSteps}"
+updateScriptLog "SETUP YOUR MAC DIALOG: Progress Increment Value: ${progressIncrementValue}"
+
+list_item_string=${list_item_array[*]/%/,}
+dialogUpdateSetupYourMac "list: ${list_item_string%?}"
+for ((i = 0; i < dialog_step_length; i++)); do
+    dialogUpdateSetupYourMac "listitem: index: $i, icon: ${setupYourMacPolicyArrayIconPrefixUrl}${icon_url_array[$i]}, status: pending, statustext: Pendente …"
+done
+dialogUpdateSetupYourMac "list: show"
+
+updateScriptLog "SETUP YOUR MAC DIALOG: Initial progress bar"
+dialogUpdateSetupYourMac "progress: 1"
+
+for ((i = 0; i < dialog_step_length; i++)); do
+    # Initialize SECONDS
+    SECONDS="0"
+
+    # Creating initial variables
+    listitem=$(get_json_value "${policyJSON}" "steps[$i].listitem")
+    icon=$(get_json_value "${policyJSON}" "steps[$i].icon")
+    progresstext=$(get_json_value "${policyJSON}" "steps[$i].progresstext")
+    trigger_list_length=$(get_json_value "${policyJSON}" "steps[$i].trigger_list.length")
+
+    # If there's a value in the variable, update running swiftDialog
+    if [[ -n "$listitem" ]]; then
+        updateScriptLog "\n\n# # #\n# SETUP YOUR MAC DIALOG: policyJSON > listitem: ${listitem}\n# # #\n"
+        dialogUpdateSetupYourMac "listitem: index: $i, status: wait, statustext: Instalando …, "
+    fi
+    if [[ -n "$icon" ]]; then dialogUpdateSetupYourMac "icon: ${setupYourMacPolicyArrayIconPrefixUrl}${icon}"; fi
+    if [[ -n "$progresstext" ]]; then dialogUpdateSetupYourMac "progresstext: $progresstext"; fi
+    if [[ -n "$trigger_list_length" ]]; then
+
+        for ((j = 0; j < trigger_list_length; j++)); do
+
+            # Setting variables within the trigger_list
+            trigger=$(get_json_value "${policyJSON}" "steps[$i].trigger_list[$j].trigger")
+            validation=$(get_json_value "${policyJSON}" "steps[$i].trigger_list[$j].validation")
+            case ${validation} in
+            "Local" | "Remote")
+                updateScriptLog "SETUP YOUR MAC DIALOG: Skipping Policy Execution due to '${validation}' validation"
+                ;;
+            *)
+                confirmPolicyExecution "${trigger}" "${validation}"
+                ;;
+            esac
+
+        done
+
+    fi
+
+    validatePolicyResult "${trigger}" "${validation}"
+
+    # Increment the progress bar
+    dialogUpdateSetupYourMac "progress: increment ${progressIncrementValue}"
+
+    # Record duration
+    updateScriptLog "SETUP YOUR MAC DIALOG: Elapsed Time: $(printf '%dh:%dm:%ds\n' $((SECONDS / 3600)) $((SECONDS % 3600 / 60)) $((SECONDS % 60)))"
+done
+
+dialogUpdateSetupYourMac "title: Seu MacBook está pronto para uso!"
+dialogUpdateSetupYourMac "icon: SF=checkmark.circle.fill,weight=bold,colour1=#00ff44,colour2=#075c1e"
+dialogUpdateSetupYourMac "progresstext: Setup concluído! Clique em Reinciar para começar a utilizar seu MacBook..."
+dialogUpdateSetupYourMac "progress: complete"
+dialogUpdateSetupYourMac "button1text: Reiniciar"
+finalize=$(dialogUpdateSetupYourMac "button1: enable")
+
+if [[ $finalize == 0 ]]; then
+    launchctl unload /Library/LaunchDaemons/com.grupopan.AutoConfig.plist
+    rm -Rf /Library/LaunchDaemons/com.grupopan.AutoConfig.plist
+    reboot
+else
+    updateScriptLog "SETUP YOUR MAC DIALOG: Reboot fail"
+fi
