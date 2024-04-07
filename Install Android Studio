@@ -1,0 +1,46 @@
+#!/bin/bash
+loggedInUser=$(echo "show State:/Users/ConsoleUser" | scutil | awk '/Name :/ { print $3 }')
+
+echo Identificando arquitetura do MacBook
+if [[ "$(uname -p)" != "arm" ]]; then
+    echo MacBook com processador Intel
+    href=$(curl -L -s https://developer.android.com/studio | grep "mac.dmg" | grep "href" | sed 's/href=// ; s/"//g' | awk 'NR==1 {print $1}')
+    filename=$(echo $href | sed -e 's/\//    /g ; s/"//g' | awk '{print $NF}')
+else
+    echo MacBook com processador M1
+    href=$(curl -L -s https://developer.android.com/studio | grep "mac_arm.dmg" | grep "href" | sed 's/href=// ; s/"//g' | awk 'NR==1 {print $1}')
+    filename=$(echo $href | sed -e 's/\//    /g ; s/"//g' | awk '{print $NF}')
+fi
+
+echo Baixando arquivo para o diretorio
+curl -L -s $href --output "/private/tmp/$filename"
+
+if [[ -e "/private/tmp/$filename" ]]; then
+    echo Montando disco para instalar Android Studio
+    hdiutil mount "/private/tmp/$filename" -mountpoint "/Volumes/Android Studio"
+
+    if [[ -d "/Volumes/Android Studio" ]]; then
+        echo Copiando Android Studio.app para pasta Applications
+        cp -R /Volumes/Android\ Studio/*.app "/Applications/"
+
+        if [[ -e "/Applications/Android Studio.app" ]]; then
+            echo Removendo arquivo baixado da internet da quarentena
+            xattr -d com.apple.quarantine "/Applications/Android Studio.app"
+            echo Mudando o dono das pastas "/Applications/Android Studio.app" e "/Library/Android/" para $loggedInUser
+            chown -R "$loggedInUser" "/Applications/Android Studio.app"
+            chown -R "$loggedInUser" "/Users/$loggedInUser/Library/Android/"
+            exitcode=0
+        else
+            exitcode=1
+        fi
+    else
+        exitcode=1
+    fi
+else
+    exitcode=1
+fi
+
+echo Finalizando
+hdiutil detach "/Volumes/Android Studio"
+
+exit $exitcode
